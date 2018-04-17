@@ -18,7 +18,7 @@ class TwitterOAuth extends Config
     const API_VERSION = '1.1';
     const API_HOST = 'https://api.twitter.com';
     const UPLOAD_HOST = 'https://upload.twitter.com';
-    const UPLOAD_CHUNK = 40960; // 1024 * 40
+    const UPLOAD_CHUNK = 1048576; // 1024 * 40
 
     /** @var Response details about the result of the last request */
     private $response;
@@ -260,27 +260,56 @@ class TwitterOAuth extends Config
      *
      * @return array|object
      */
-    private function uploadMediaChunked($path, array $parameters)
-    {
+    private function uploadMediaChunked($path, array $parameters) {
+        $flag = true;
         $init = $this->http('POST', self::UPLOAD_HOST, $path, $this->mediaInitParameters($parameters));
         // Append
+        $acum = 0;
         $segment_index = 0;
-        $media = fopen($parameters['media'], 'rb');
-        while (!feof($media))
-        {
-            $this->http('POST', self::UPLOAD_HOST, 'media/upload', [
+        //$media = fopen($parameters['media'], 'rb');
+        $url = explode("images/", $parameters['media']);
+        $stringFileTotal = \Storage::disk('s3')->get("images/" . $url[1]);
+        $cantByteTotal = strlen($stringFileTotal);
+        //        $cantByteTotal = fread($media, self::UPLOAD_CHUNK);
+        while ($cantByteTotal > 0) {
+
+            if ($cantByteTotal >= self::UPLOAD_CHUNK) {
+                $byteFile = substr($stringFileTotal, $segment_index * self::UPLOAD_CHUNK, self::UPLOAD_CHUNK);
+            } else {
+                $byteFile = substr($stringFileTotal, $segment_index * self::UPLOAD_CHUNK, $cantByteTotal);
+            }
+
+            $cantByteTotal = $cantByteTotal - self::UPLOAD_CHUNK;
+
+            $acum += strlen($byteFile);
+
+            $result = $this->http('POST', self::UPLOAD_HOST, 'media/upload', [
                 'command' => 'APPEND',
                 'media_id' => $init->media_id_string,
                 'segment_index' => $segment_index++,
-                'media_data' => base64_encode(fread($media, self::UPLOAD_CHUNK))
+                'media_data' => base64_encode($byteFile)
             ]);
         }
-        fclose($media);
+        //var_dump($acum);
+        //fclose($media);
         // Finalize
+
         $finalize = $this->http('POST', self::UPLOAD_HOST, 'media/upload', [
             'command' => 'FINALIZE',
             'media_id' => $init->media_id_string
         ]);
+
+        while ($flag) {
+
+            $status = $this->http('GET', self::UPLOAD_HOST, 'media/upload', [
+                'command' => 'STATUS',
+                'media_id' => $init->media_id_string
+            ]);
+
+            if($status->processing_info->state != "in_progress"){
+                $flag = false;
+            }
+        }
         return $finalize;
     }
 
@@ -296,9 +325,11 @@ class TwitterOAuth extends Config
     {
         $return = [
             'command' => 'INIT',
-            'media_type' => $parameters['media_type'],
-            'total_bytes' => isset($parameters['total_bytes']) ? $parameters['total_bytes'] : filesize($parameters['media'])
+            'media_type' => "video/*",
+            'total_bytes' => isset($parameters['total_bytes']) ? $parameters['total_bytes'] : filesize($parameters['media']),
+            'media_category' => 'tweet_video'
         ];
+      //  var_dump($return);
         if (isset($parameters['additional_owners'])) {
             $return['additional_owners'] = $parameters['additional_owners'];
         }
@@ -418,12 +449,14 @@ class TwitterOAuth extends Config
                 break;
         }
 
+
+
         if (in_array($method, ['GET', 'PUT', 'DELETE']) && !empty($postfields)) {
             $options[CURLOPT_URL] .= '?' . Util::buildHttpQuery($postfields);
         }
 
-
         $curlHandle = curl_init();
+
         curl_setopt_array($curlHandle, $options);
         $response = curl_exec($curlHandle);
 
@@ -433,6 +466,7 @@ class TwitterOAuth extends Config
         }
 
         $this->response->setHttpCode(curl_getinfo($curlHandle, CURLINFO_HTTP_CODE));
+       // var_dump($this->response->getHttpCode());
         $parts = explode("\r\n\r\n", $response);
         $responseBody = array_pop($parts);
         $responseHeader = array_pop($parts);
